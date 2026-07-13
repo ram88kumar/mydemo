@@ -1,0 +1,106 @@
+name: Build and Deploy
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Install and test
+        working-directory: app
+        run: |
+          npm install
+          npm test
+    
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.github_token }}
+
+      - name: Build and push Docker image
+        id: push
+        working-directory: app
+        run: |
+          IMAGE="ghcr.io/${{ github.repository}}:${{ github.sha }}"
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: dev
+    steps:
+      - name: Deploy to dev environment
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            IMAGE="${{ needs.build.outputs.image }}"
+            cd /tmp
+            rm -rf deploy-files
+            git clone https://github.com/${{ github.repository }}.git deploy-files
+            cd deploy-files
+            sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|g" k8s/dev/app.yml
+            DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id devops-demo/dev/db-password --query SecretString --output text --region us-east-1 | jq -r '.DB_PASSWORD')
+            kubectl create secret generic db-secret --namespace dev --from-literal=DB_PASSWORD="$DB_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -f k8s/dev/mysql.yml
+            kubectl apply -f k8s/dev/app.yml
+            kubectl rollout status deployment/demo-app --namespace dev --timeout=180s
+            kubectl get pods --namespace dev
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: prod
+    steps:
+      - name: Deploy to prod environment
+        uses: appleboy/ssh-action@v0.1.6
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            IMAGE="${{ needs.build.outputs.image }}"
+            cd /tmp
+            rm -rf deploy-files
+            git clone https://github.com/${{ github.repository }}.git deploy-files
+            cd deploy-files
+            sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|g" k8s/prod/app.yml
+            DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id devops-demo/prod/db-password --query SecretString --output text --region us-east-1 | jq -r '.DB_PASSWORD')
+            kubectl create secret generic db-secret --namespace prod --from-literal=DB_PASSWORD="$DB_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl apply -f k8s/prod/mysql.yml
+            kubectl apply -f k8s/prod/app.yml
+            kubectl rollout status deployment/demo-app --namespace prod --timeout=180s
+            kubectl get pods --namespace prod
